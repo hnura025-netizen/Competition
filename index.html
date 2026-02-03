@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>3D Race: Player vs AI</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; font-family: 'Segoe UI', sans-serif; }
+        #ui { position: absolute; top: 20px; left: 20px; color: white; text-shadow: 2px 2px 4px #000; z-index: 100; }
+        .speed { font-size: 2.5rem; font-weight: 800; color: #00ffcc; }
+        #lapCounter { font-size: 1.2rem; margin-top: 10px; }
+        #position { font-size: 1.5rem; color: #ffcc00; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div class="speed"><span id="speedo">0</span> KM/H</div>
+        <div>W/A/S/D or Arrows to Drive</div>
+        <div id="lapCounter">Lap: 1/3</div>
+        <div id="position">Position: 1st</div>
+        <div id="status">RACE START!</div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import * as CANNON from 'cannon-es';
+
+        // --- WORLD SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x333344);
+        scene.fog = new THREE.Fog(0x333344, 10, 300);
+        
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        const world = new CANNON.World({ 
+            gravity: new CANNON.Vec3(0, -9.82, 0),
+            frictionGravity: new CANNON.Vec3(0, -9.82, 0)
+        });
+
+        // --- LIGHTING ---
+        scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+        const sun = new THREE.DirectionalLight(0xffffff, 1);
+        sun.position.set(50, 100, 50);
+        sun.castShadow = true;
+        sun.shadow.mapSize.width = 2048;
+        sun.shadow.mapSize.height = 2048;
+        sun.shadow.camera.near = 0.5;
+        sun.shadow.camera.far = 500;
+        sun.shadow.camera.left = -100;
+        sun.shadow.camera.right = 100;
+        sun.shadow.camera.top = 100;
+        sun.shadow.camera.bottom = -100;
+        scene.add(sun);
+
+        // --- TRACK CREATION ---
+        function createTrackSegment(startZ, length) {
+            // Visual Road
+            const roadGeom = new THREE.PlaneGeometry(20, length);
+            const roadMat = new THREE.MeshStandardMaterial({ 
+                color: 0x222222,
+                roughness: 0.8,
+                metalness: 0.2
+            });
+            const road = new THREE.Mesh(roadGeom, roadMat);
+            road.receiveShadow = true;
+            road.rotation.x = -Math.PI / 2;
+            road.position.z = startZ + length/2;
+            scene.add(road);
+
+            // Physics Ground
+            const groundShape = new CANNON.Box(new CANNON.Vec3(10, 0.1, length/2));
+            const groundBody = new CANNON.Body({ 
+                type: CANNON.Body.STATIC, 
+                shape: groundShape,
+                material: new CANNON.Material({ friction: 0.8 })
+            });
+            groundBody.position.set(0, -0.1, startZ + length/2);
+            world.addBody(groundBody);
+
+            // Road markings
+            for (let z = 0; z < length; z += 20) {
+                const lineGeom = new THREE.PlaneGeometry(1, 10);
+                const lineMat = new THREE.MeshStandardMaterial({ color: 0xffff00 });
+                const line = new THREE.Mesh(lineGeom, lineMat);
+                line.rotation.x = -Math.PI / 2;
+                line.position.set(0, 0.01, startZ + z);
+                scene.add(line);
+            }
+
+            // Side barriers
+            const barrierGeom = new THREE.BoxGeometry(1, 1, length);
+            const barrierMat = new THREE.MeshStandardMaterial({ color: 0x666666 });
+            
+            const leftBarrier = new THREE.Mesh(barrierGeom, barrierMat);
+            leftBarrier.position.set(-10.5, 0.5, startZ + length/2);
+            leftBarrier.castShadow = true;
+            scene.add(leftBarrier);
+            
+            const rightBarrier = new THREE.Mesh(barrierGeom, barrierMat);
+            rightBarrier.position.set(10.5, 0.5, startZ + length/2);
+            rightBarrier.castShadow = true;
+            scene.add(rightBarrier);
+
+            // Physics for barriers
+            const barrierShape = new CANNON.Box(new CANNON.Vec3(0.5, 0.5, length/2));
+            const leftBarrierBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: barrierShape });
+            leftBarrierBody.position.set(-10.5, 0.5, startZ + length/2);
+            world.addBody(leftBarrierBody);
+            
+            const rightBarrierBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: barrierShape });
+            rightBarrierBody.position.set(10.5, 0.5, startZ + length/2);
+            world.addBody(rightBarrierBody);
+        }
+
+        // Create multiple track segments
+        for (let i = 0; i < 10; i++) {
+            createTrackSegment(i * 200, 200);
+        }
+
+        // --- VEHICLE CREATOR FUNCTION ---
+        function createVehicle(color, startPos) {
+            const chassisShape = new CANNON.Box(new CANNON.Vec3(1, 0.5, 2));
+            const chassisBody = new CANNON.Body({ 
+                mass: 150,
+                material: new CANNON.Material({ friction: 0.8 })
+            });
+            chassisBody.addShape(chassisShape);
+            chassisBody.position.copy(startPos);
+            chassisBody.angularDamping = 0.5;
+            chassisBody.linearDamping = 0.1;
+            
+            const v = new CANNON.RaycastVehicle({
+                chassisBody,
+                indexRightAxis: 0, 
+                indexUpAxis: 1, 
+                indexForwardAxis: 2
+            });
+
+            const wheelOptions = {
+                radius: 0.3,
+                directionLocal: new CANNON.Vec3(0, -1, 0),
+                suspensionStiffness: 50,
+                suspensionRestLength: 0.3,
+                dampingRelaxation: 2.3,
+                dampingCompression: 4.4,
+                maxSuspensionForce: 100000,
+                rollInfluence: 0.01,
+                axleLocal: new CANNON.Vec3(-1, 0, 0),
+                chassisConnectionPointLocal: new CANNON.Vec3(0, 0, 0),
+                maxSuspensionTravel: 0.3,
+                customSlidingRotationalSpeed: -30,
+                useCustomSlidingRotationalSpeed: true
+            };
+
+            const positions = [
+                new CANNON.Vec3(1, -0.2, 1.2),  // Front right
+                new CANNON.Vec3(-1, -0.2, 1.2), // Front left
+                new CANNON.Vec3(1, -0.2, -1.2), // Rear right
+                new CANNON.Vec3(-1, -00.2, -1.2) // Rear left
+            ];
+
+            positions.forEach(p => {
+                wheelOptions.chassisConnectionPointLocal.copy(p);
+                v.addWheel(wheelOptions);
+            });
+
+            v.addToWorld(world);
+
+            // Visual group
+            const group = new THREE.Group();
+            
+            // Car body
+            const bodyGeom = new THREE.BoxGeometry(2, 0.8, 3.5);
+            const bodyMat = new THREE.MeshStandardMaterial({ 
+                color: color,
+                roughness: 0.4,
+                metalness: 0.6
+            });
+            const bodyMesh = new THREE.Mesh(bodyGeom, bodyMat);
+            bodyMesh.castShadow = true;
+            bodyMesh.position.y = 0.4;
+            group.add(bodyMesh);
+
+            // Car top
+            const topGeom = new THREE.BoxGeometry(1.5, 0.4, 2);
+            const topMat = new THREE.MeshStandardMaterial({ color: color });
+            const topMesh = new THREE.Mesh(topGeom, topMat);
+            topMesh.castShadow = true;
+            topMesh.position.y = 1.1;
+            group.add(topMesh);
+
+            // Wheels
+            const wheelGeom = new THREE.CylinderGeometry(0.3, 0.3, 0.2, 16);
+            const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+            const wheels = [];
+            
+            for (let i = 0; i < 4; i++) {
+                const wheel = new THREE.Mesh(wheelGeom, wheelMat);
+                wheel.castShadow = true;
+                wheels.push(wheel);
+                group.add(wheel);
+            }
+
+            // Store wheels for rotation updates
+            group.userData.wheels = wheels;
+            group.userData.wheelIndices = [0, 1, 2, 3];
+            
+            scene.add(group);
+
+            return { 
+                v, 
+                body: chassisBody, 
+                mesh: group,
+                wheels: wheels,
+                currentWaypoint: 0,
+                lap: 1,
+                finished: false
+            };
+        }
+
+        // --- SPAWN RACERS ---
+        const player = createVehicle(0xff0000, new CANNON.Vec3(0, 2, 0));
+        const opponents = [
+            createVehicle(0x0066ff, new CANNON.Vec3(-3, 2, 10)),
+            createVehicle(0x00ff66, new CANNON.Vec3(3, 2, 20)),
+            createVehicle(0xff6600, new CANNON.Vec3(0, 2, 30))
+        ];
+
+        const allCars = [player, ...opponents];
+
+        // --- INPUTS ---
+        const keys = {};
+        window.addEventListener('keydown', (e) => {
+            keys[e.code] = true;
+            e.preventDefault();
+        });
+        window.addEventListener('keyup', (e) => {
+            keys[e.code] = false;
+            e.preventDefault();
+        });
+
+        // --- RACE LOGIC ---
+        const totalLaps = 3;
+        const waypoints = [];
+        for (let i = 0; i < 100; i++) {
+            waypoints.push(new THREE.Vector3(0, 0, i * 20));
+        }
+
+        function updateRaceLogic() {
+            // Update positions
+            const sortedCars = [...allCars].sort((a, b) => b.body.position.z - a.body.position.z);
+            const playerIndex = sortedCars.findIndex(car => car === player) + 1;
+            document.getElementById('position').textContent = `Position: ${playerIndex}${getOrdinalSuffix(playerIndex)}`;
+            document.getElementById('lapCounter').textContent = `Lap: ${player.lap}/${totalLaps}`;
+
+            // Check lap completion
+            if (player.body.position.z > waypoints[waypoints.length-1].z && !player.finished) {
+                player.lap++;
+                player.body.position.z = 0;
+                player.currentWaypoint = 0;
+                
+                if (player.lap > totalLaps) {
+                    player.finished = true;
+                    document.getElementById('status').textContent = "FINISHED!";
+                } else {
+                    document.getElementById('status').textContent = `LAP ${player.lap}!`;
+                    setTimeout(() => {
+                        document.getElementById('status').textContent = "";
+                    }, 2000);
+                }
+            }
+        }
+
+        function getOrdinalSuffix(n) {
+            if (n > 3 && n < 21) return 'th';
+            switch (n % 10) {
+                case 1: return 'st';
+                case 2: return 'nd';
+                case 3: return 'rd';
+                default: return 'th';
+            }
+        }
+
+        // --- AI CONTROL ---
+        function updateAI(opponent) {
+            if (opponent.finished) return;
+
+            // Simple AI: follow waypoints
+            const targetWaypoint = waypoints[opponent.currentWaypoint];
+            const carPos = opponent.body.position;
+            
+            const distanceToWaypoint = carPos.distanceTo(targetWaypoint);
+            if (distanceToWaypoint < 10) {
+                opponent.currentWaypoint = (opponent.currentWaypoint + 1) % waypoints.length;
+            }
+
+            // Basic steering toward waypoint
+            const direction = new THREE.Vector3().subVectors(targetWaypoint, carPos).normalize();
+            const carForward = new THREE.Vector3(0, 0, -1).applyQuaternion(opponent.mesh.quaternion);
+            const angle = direction.angleTo(carForward);
+            
+            const cross = new THREE.Vector3().crossVectors(carForward, direction);
+            const steerValue = cross.y > 0 ? -angle * 0.5 : angle * 0.5;
+            
+            opponent.v.setSteeringValue(Math.max(-0.5, Math.min(0.5, steerValue)), 0);
+            opponent.v.setSteeringValue(Math.max(-0.5, Math.min(0.5, steerValue)), 1);
+
+            // Apply engine force
+            opponent.v.applyEngineForce(-700, 2);
+            opponent.v.applyEngineForce(-700, 3);
+        }
+
+        // --- CAMERA SMOOTHING ---
+        const cameraOffset = new THREE.Vector3(0, 4, 10);
+        const cameraTarget = new THREE.Vector3();
+        let cameraSpeed = 0.1;
+
+        // --- MAIN LOOP ---
+        function update() {
+            requestAnimationFrame(update);
+            world.fixedStep();
+
+            // 1. Player Control
+            const force = 800;
+            const brakeForce = 500;
+            const steer = 0.6;
+            
+            const forwardForce = (keys['KeyW'] || keys['ArrowUp']) ? -force : 0;
+            const backwardForce = (keys['KeyS'] || keys['ArrowDown']) ? force : 0;
+            const brake = (keys['KeyS'] || keys['ArrowDown']) ? brakeForce : 0;
+
+            player.v.applyEngineForce(forwardForce + backwardForce, 2);
+            player.v.applyEngineForce(forwardForce + backwardForce, 3);
+            
+            // Apply braking
+            if (brake > 0) {
+                player.v.setBrake(brake, 2);
+                player.v.setBrake(brake, 3);
+            } else {
+                player.v.setBrake(0, 2);
+                player.v.setBrake(0, 3);
+            }
+            
+            const sVal = (keys['KeyA'] || keys['ArrowLeft']) ? steer : 
+                        (keys['KeyD'] || keys['ArrowRight']) ? -steer : 0;
+            player.v.setSteeringValue(sVal, 0);
+            player.v.setSteeringValue(sVal, 1);
+
+            // 2. AI Control
+            opponents.forEach(updateAI);
+
+            // 3. Sync Visuals
+            allCars.forEach(car => {
+                car.mesh.position.copy(car.body.position);
+                car.mesh.quaternion.copy(car.body.quaternion);
+                
+                // Update wheel rotations
+                car.v.updateWheelTransform();
+                car.userData.wheelIndices.forEach((wheelIndex, i) => {
+                    const transform = car.v.wheelInfos[wheelIndex].worldTransform;
+                    car.wheels[i].position.copy(transform.position);
+                    car.wheels[i].quaternion.copy(transform.quaternion);
+                    
+                    // Rotate wheels based on speed
+                    const rotation = car.v.getWheelSpeed(wheelIndex) * 0.1;
+                    car.wheels[i].rotateX(rotation);
+                });
+            });
+
+            // 4. Smooth Camera
+            const desiredPosition = player.mesh.position.clone()
+                .add(cameraOffset.clone().applyQuaternion(player.mesh.quaternion));
+            
+            camera.position.lerp(desiredPosition, cameraSpeed);
+            cameraTarget.lerp(player.mesh.position, cameraSpeed);
+            camera.lookAt(cameraTarget);
+
+            // 5. Update UI
+            const speedKmh = Math.abs(player.body.velocity.z * 3.6);
+            document.getElementById('speedo').innerText = Math.floor(speedKmh);
+            
+            // 6. Race logic
+            updateRaceLogic();
+            
+            renderer.render(scene, camera);
+        }
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        update();
+    </script>
+</body>
+</html>
